@@ -113,25 +113,6 @@ jobs:
               "$work_dir"
           done
 
-      - name: Package firmware binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          find dist -type f -maxdepth 3 -print | sort
-          cd dist
-          zip -r ../donut-os-firmware.zip .
-
-      - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: donut-os-firmware-${{ github.sha }}
-          path: |
-            dist/**/*.bin
-            dist/**/*.elf
-            dist/**/*.map
-            donut-os-firmware.zip
-          if-no-files-found: error
-
       - name: Resolve release tag
         id: release_tag
         shell: bash
@@ -145,6 +126,64 @@ jobs:
             echo "tag=" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Package firmware artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          find dist -maxdepth 3 -type f -print | sort
+          mkdir -p release
+          (cd dist && zip -r ../release/DONUT.OS-full.zip .)
+
+      - name: Prepare release assets
+        if: steps.release_tag.outputs.tag != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release_tag.outputs.tag }}"
+          out="DONUT.OS-${tag}.bin"
+
+          mapfile -t merged_candidates < <(find dist -type f \( -name "*.merged.bin" -o -name "*merged*.bin" \) | sort)
+          if [ "${#merged_candidates[@]}" -eq 0 ]; then
+            echo "No merged firmware binary found." >&2
+            find dist -type f -print >&2
+            exit 1
+          fi
+
+          preferred=""
+          for file in "${merged_candidates[@]}"; do
+            if [[ "$file" == *"qol_final"* || "$file" == *"go_deepsleep_wakeclean"* || "$file" == *"go_deepsleep_fixed"* ]]; then
+              preferred="$file"
+              break
+            fi
+          done
+
+          if [ -z "$preferred" ]; then
+            if [ "${#merged_candidates[@]}" -eq 1 ]; then
+              preferred="${merged_candidates[0]}"
+            else
+              echo "Multiple merged binaries found and no QoL final candidate was detected." >&2
+              printf '%s\n' "${merged_candidates[@]}" >&2
+              exit 1
+            fi
+          fi
+
+          cp "$preferred" "release/$out"
+          (cd release && zip "DONUT.OS-${tag}.zip" "$out")
+          cp "release/DONUT.OS-full.zip" "release/DONUT.OS-${tag}-full.zip"
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: donut-os-firmware-${{ github.sha }}
+          path: |
+            dist/**/*.bin
+            dist/**/*.elf
+            dist/**/*.map
+            release/DONUT.OS-full.zip
+            release/DONUT.OS-*.bin
+            release/DONUT.OS-*.zip
+          if-no-files-found: error
+
       - name: Create GitHub Release
         if: steps.release_tag.outputs.tag != ''
         uses: softprops/action-gh-release@v2
@@ -155,5 +194,6 @@ jobs:
           draft: false
           prerelease: ${{ contains(steps.release_tag.outputs.tag, 'qol') }}
           files: |
-            dist/**/*.bin
-            donut-os-firmware.zip
+            release/DONUT.OS-${{ steps.release_tag.outputs.tag }}.bin
+            release/DONUT.OS-${{ steps.release_tag.outputs.tag }}.zip
+            release/DONUT.OS-${{ steps.release_tag.outputs.tag }}-full.zip
