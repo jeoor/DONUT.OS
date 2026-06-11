@@ -140,7 +140,6 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.release_tag.outputs.tag }}"
-          out="DONUT.OS-${tag}.bin"
 
           mapfile -t merged_candidates < <(find dist -type f \( -name "*.merged.bin" -o -name "*merged*.bin" \) | sort)
           if [ "${#merged_candidates[@]}" -eq 0 ]; then
@@ -149,42 +148,34 @@ jobs:
             exit 1
           fi
 
-          preferred=""
-
-          # Prefer the output folder named "qol". Current repo builds paths like:
-          # dist/mainline/mainline.ino.merged.bin
-          # dist/qol/qol.ino.merged.bin
+          declare -A used_variants=()
           for file in "${merged_candidates[@]}"; do
-            if [[ "$file" == dist/qol/* ]]; then
-              preferred="$file"
-              break
+            variant="$(basename "$(dirname "$file")")"
+            if [ "$variant" = "dist" ] || [ -z "$variant" ]; then
+              variant="$(basename "$file" .merged.bin)"
+              variant="${variant%.ino}"
             fi
-          done
 
-          # Also support future folder/file names without breaking older releases.
-          if [ -z "$preferred" ]; then
-            for file in "${merged_candidates[@]}"; do
-              if [[ "$file" == */qol/* || "$file" == *"qol_final"* || "$file" == *"go_deepsleep_wakeclean"* || "$file" == *"go_deepsleep_fixed"* ]]; then
-                preferred="$file"
-                break
-              fi
-            done
-          fi
+            # Keep filenames portable and deterministic.
+            variant="$(printf '%s' "$variant" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+            if [ -z "$variant" ]; then
+              variant="firmware"
+            fi
 
-          # Single firmware layout: if there is only one merged bin, use it.
-          if [ -z "$preferred" ]; then
-            if [ "${#merged_candidates[@]}" -eq 1 ]; then
-              preferred="${merged_candidates[0]}"
-            else
-              echo "Multiple merged binaries found, but no QoL candidate was detected." >&2
-              printf '%s\n' "${merged_candidates[@]}" >&2
+            if [ -n "${used_variants[$variant]:-}" ]; then
+              echo "Duplicate merged binary variant detected: $variant" >&2
+              echo "Existing: ${used_variants[$variant]}" >&2
+              echo "New: $file" >&2
               exit 1
             fi
-          fi
+            used_variants[$variant]="$file"
 
-          echo "Using release binary: $preferred"
-          cp "$preferred" "release/$out"
-          (cd release && zip "DONUT.OS-${tag}.zip" "$out")
+            out="DONUT.OS-${tag}-${variant}.bin"
+            echo "Using release binary for ${variant}: $file"
+            cp "$file" "release/$out"
+            (cd release && zip "DONUT.OS-${tag}-${variant}.zip" "$out")
+          done
+
           cp "release/DONUT.OS-full.zip" "release/DONUT.OS-${tag}-full.zip"
 
       - name: Upload firmware artifacts
@@ -209,7 +200,7 @@ jobs:
           name: DONUT.OS ${{ steps.release_tag.outputs.tag }}
           draft: false
           prerelease: ${{ contains(steps.release_tag.outputs.tag, 'qol') }}
+          generate_release_notes: true
           files: |
-            release/DONUT.OS-${{ steps.release_tag.outputs.tag }}.bin
-            release/DONUT.OS-${{ steps.release_tag.outputs.tag }}.zip
-            release/DONUT.OS-${{ steps.release_tag.outputs.tag }}-full.zip
+            release/DONUT.OS-${{ steps.release_tag.outputs.tag }}-*.bin
+            release/DONUT.OS-${{ steps.release_tag.outputs.tag }}-*.zip
