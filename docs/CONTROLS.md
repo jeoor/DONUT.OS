@@ -45,7 +45,7 @@ Complete controls reference for DONUT.OS.
 
 ## Notes
 
-- **GO / G0 DeepSleep** is only available in the QoL version (`donut_cardputer_os_qol_go_deepsleep_fixed`).
+- **GO / G0 DeepSleep** is only available in the QoL version (`firmware/qol`).
 - **Factory Reset** clears all persisted preferences and restarts the device.
 - **AutoDim** activates after idle timeout (QoL version). Any key press restores brightness.
 - **AutoSleep** activates after long idle (QoL version). Guarded when Stopwatch/Timer is running.

@@ -39,8 +39,8 @@ Choose one of the two firmware versions:
 
 | Version | Path |
 |---------|------|
-| Mainline (frozen) | `firmware/donut_cardputer_os_final_release_checked/donut_cardputer_os_final_release_checked.ino` |
-| QoL (recommended) | `firmware/donut_cardputer_os_qol_go_deepsleep_fixed/donut_cardputer_os_qol_go_deepsleep_fixed.ino` |
+| Mainline (frozen) | `firmware/mainline/mainline.ino` |
+| QoL (recommended) | `firmware/qol/qol.ino` |
 
 ## Step 5: Compile and Upload
 

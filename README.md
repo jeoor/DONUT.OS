@@ -129,8 +129,8 @@ See [docs/CONTROLS.md](docs/CONTROLS.md) for full details.
 
 | Version | Description |
 |---------|-------------|
-| `donut_cardputer_os_final_release_checked` | Mainline frozen release. Most stable, no QoL features. |
-| `donut_cardputer_os_qol_go_deepsleep_fixed` | QoL release with AutoDim and GO-button DeepSleep. **Recommended.** |
+| `mainline` | Mainline frozen release. Most stable, no QoL features. |
+| `qol` | QoL release with AutoDim and GO-button DeepSleep. **Recommended.** |
 
 ## Design Notes
 
