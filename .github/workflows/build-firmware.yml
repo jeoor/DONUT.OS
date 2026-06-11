@@ -21,7 +21,7 @@ on:
         type: boolean
         default: false
       release_tag:
-        description: "Release tag for manual publish, e.g. v1.1.0-qol"
+        description: "Release tag for manual publish, e.g. 0.1.1 or v1.1.0-qol"
         required: false
         type: string
 
@@ -126,7 +126,7 @@ jobs:
             echo "tag=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Package firmware artifacts
+      - name: Package full firmware archive
         shell: bash
         run: |
           set -euo pipefail
@@ -150,23 +150,39 @@ jobs:
           fi
 
           preferred=""
+
+          # Prefer the output folder named "qol". Current repo builds paths like:
+          # dist/mainline/mainline.ino.merged.bin
+          # dist/qol/qol.ino.merged.bin
           for file in "${merged_candidates[@]}"; do
-            if [[ "$file" == *"qol_final"* || "$file" == *"go_deepsleep_wakeclean"* || "$file" == *"go_deepsleep_fixed"* ]]; then
+            if [[ "$file" == dist/qol/* ]]; then
               preferred="$file"
               break
             fi
           done
 
+          # Also support future folder/file names without breaking older releases.
+          if [ -z "$preferred" ]; then
+            for file in "${merged_candidates[@]}"; do
+              if [[ "$file" == */qol/* || "$file" == *"qol_final"* || "$file" == *"go_deepsleep_wakeclean"* || "$file" == *"go_deepsleep_fixed"* ]]; then
+                preferred="$file"
+                break
+              fi
+            done
+          fi
+
+          # Single firmware layout: if there is only one merged bin, use it.
           if [ -z "$preferred" ]; then
             if [ "${#merged_candidates[@]}" -eq 1 ]; then
               preferred="${merged_candidates[0]}"
             else
-              echo "Multiple merged binaries found and no QoL final candidate was detected." >&2
+              echo "Multiple merged binaries found, but no QoL candidate was detected." >&2
               printf '%s\n' "${merged_candidates[@]}" >&2
               exit 1
             fi
           fi
 
+          echo "Using release binary: $preferred"
           cp "$preferred" "release/$out"
           (cd release && zip "DONUT.OS-${tag}.zip" "$out")
           cp "release/DONUT.OS-full.zip" "release/DONUT.OS-${tag}-full.zip"
