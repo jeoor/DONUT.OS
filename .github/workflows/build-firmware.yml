@@ -3,6 +3,8 @@ name: Build Firmware
 on:
   push:
     branches: [main]
+    tags:
+      - "v*"
     paths:
       - "firmware/**"
       - ".github/workflows/build-firmware.yml"
@@ -12,6 +14,19 @@ on:
       - "firmware/**"
       - ".github/workflows/build-firmware.yml"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Create a GitHub Release from this build"
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: "Release tag for manual publish, e.g. v1.1.0-qol"
+        required: false
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -98,12 +113,15 @@ jobs:
               "$work_dir"
           done
 
-      - name: List build outputs
+      - name: Package firmware binaries
         shell: bash
         run: |
+          set -euo pipefail
           find dist -type f -maxdepth 3 -print | sort
+          cd dist
+          zip -r ../donut-os-firmware.zip .
 
-      - name: Upload firmware binaries
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: donut-os-firmware-${{ github.sha }}
@@ -111,4 +129,31 @@ jobs:
             dist/**/*.bin
             dist/**/*.elf
             dist/**/*.map
+            donut-os-firmware.zip
           if-no-files-found: error
+
+      - name: Resolve release tag
+        id: release_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.publish_release }}" == "true" && -n "${{ inputs.release_tag }}" ]]; then
+            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: steps.release_tag.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: DONUT.OS ${{ steps.release_tag.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.release_tag.outputs.tag, 'qol') }}
+          files: |
+            dist/**/*.bin
+            donut-os-firmware.zip
