@@ -1,6 +1,6 @@
 /*
  * DONUT.OS for M5Stack Cardputer / Cardputer-ADV
- * QoL branch: release core + warning cleanup + AutoDim + GO deep sleep.
+ * QoL branch: release core + warning cleanup + AutoDim + GO deep sleep + fast wake overlay.
  *
  * References:
  * - a1k0n donut math: https://www.a1k0n.net/2011/07/20/donut-math.html
@@ -76,6 +76,7 @@ static constexpr float VIEW_LIMIT_Y = 28.0f;
 static constexpr uint32_t IDLE_ORBIT_MS = 8000;
 static constexpr uint16_t TOAST_MS = 900;
 static constexpr uint16_t BOOT_OVERLAY_MS = 5200;
+static constexpr uint16_t WAKE_OVERLAY_MS = 900;
 static constexpr uint16_t BOOT_STAGE1_MS = 1200;
 static constexpr uint16_t BOOT_STAGE2_MS = 2600;
 // M5Canvas direct buffer writes need the Cardputer LCD byte order.
@@ -370,6 +371,7 @@ static uint32_t frameNumber = 0;
 static uint16_t bgToneLut[BG_H][5];
 static uint32_t startMs = 0;
 static uint32_t lastInputMs = 0;
+static bool wokeFromGoSleep = false;
 static uint32_t fpsLastMs = 0;
 static uint16_t fpsFrames = 0;
 static float measuredFps = 0.0f;
@@ -1594,6 +1596,23 @@ static void drawToast() {
 
 static void drawBootOverlay() {
     uint32_t age = millis() - startMs;
+
+    if (wokeFromGoSleep) {
+        if (age > WAKE_OVERLAY_MS) return;
+
+        const int x = 54;
+        const int y = TOP_BAR_H + 10;
+        const int w = 132;
+        const int h = 28;
+        drawPanelFrame(x, y, w, h);
+        canvas.setTextSize(1);
+        canvas.setTextWrap(false, false);
+        printPanelLine(x + 8, y + 5, "DONUT.OS", drawPalette.text);
+        printPanelLine(x + w - 45, y + 5, "WAKE", drawPalette.hint);
+        printPanelLine(x + 8, y + 16, "GO RESUME", drawPalette.textDim);
+        return;
+    }
+
     if (age > BOOT_OVERLAY_MS) return;
 
     const int x = 14;
@@ -2465,6 +2484,7 @@ static void limitFrameRate(uint32_t frameStartUs) {
 // Setup and loop
 
 void setup() {
+    wokeFromGoSleep = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
     rtc_gpio_deinit(GO_WAKE_GPIO);
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
