@@ -1,0 +1,114 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/build-firmware.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/build-firmware.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile Arduino sketches
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install M5Stack ESP32 board support
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+          arduino-cli core update-index
+          arduino-cli core install m5stack:esp32
+
+      - name: Install libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli lib update-index
+          arduino-cli lib install "M5Cardputer"
+          arduino-cli lib install "M5GFX"
+
+      - name: Detect Cardputer FQBN
+        id: fqbn
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEFAULT_FQBN="m5stack:esp32:m5stack_cardputer"
+          if arduino-cli board details -b "$DEFAULT_FQBN" >/dev/null 2>&1; then
+            echo "fqbn=$DEFAULT_FQBN" >> "$GITHUB_OUTPUT"
+            echo "Using FQBN: $DEFAULT_FQBN"
+            exit 0
+          fi
+
+          DETECTED_FQBN="$(arduino-cli board listall | awk 'BEGIN{IGNORECASE=1} /cardputer/ {print $NF; exit}')"
+          if [ -z "$DETECTED_FQBN" ]; then
+            echo "Could not detect a Cardputer FQBN from arduino-cli board listall." >&2
+            arduino-cli board listall >&2
+            exit 1
+          fi
+
+          echo "fqbn=$DETECTED_FQBN" >> "$GITHUB_OUTPUT"
+          echo "Using detected FQBN: $DETECTED_FQBN"
+
+      - name: Compile firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          FQBN="${{ steps.fqbn.outputs.fqbn }}"
+          mkdir -p build/sketches dist
+
+          mapfile -t SKETCHES < <(find firmware -type f -name "*.ino" | sort)
+          if [ "${#SKETCHES[@]}" -eq 0 ]; then
+            echo "No .ino files found under firmware/." >&2
+            exit 1
+          fi
+
+          for sketch in "${SKETCHES[@]}"; do
+            name="$(basename "$sketch" .ino)"
+            src_dir="$(dirname "$sketch")"
+            work_dir="build/sketches/$name"
+            out_dir="$PWD/dist/$name"
+
+            rm -rf "$work_dir" "$out_dir"
+            mkdir -p "$work_dir" "$out_dir"
+
+            # Keep Arduino's sketch-folder rule even if the repository layout changes.
+            cp -R "$src_dir"/. "$work_dir"/
+            cp "$sketch" "$work_dir/$name.ino"
+
+            echo "Compiling $sketch"
+            arduino-cli compile \
+              --fqbn "$FQBN" \
+              --warnings all \
+              --output-dir "$out_dir" \
+              "$work_dir"
+          done
+
+      - name: List build outputs
+        shell: bash
+        run: |
+          find dist -type f -maxdepth 3 -print | sort
+
+      - name: Upload firmware binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: donut-os-firmware-${{ github.sha }}
+          path: |
+            dist/**/*.bin
+            dist/**/*.elf
+            dist/**/*.map
+          if-no-files-found: error
