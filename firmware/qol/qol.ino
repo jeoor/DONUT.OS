@@ -60,8 +60,6 @@ static constexpr float BACKFACE_EPS = 0.06f;
 
 static constexpr int STD_THETA = 18;
 static constexpr int STD_PHI = 48;
-static constexpr int HQ_THETA = 24;
-static constexpr int HQ_PHI = 64;
 
 static constexpr uint8_t LUM_DARK_MIN = 10;
 static constexpr uint8_t LUM_BRIGHT_MAX = 210;
@@ -104,7 +102,6 @@ static constexpr int GLOW_RADIUS = 2;
 
 static constexpr uint8_t BG_REBUILD_INTERVAL_CALM = 1;
 static constexpr uint8_t BG_REBUILD_INTERVAL_ACTIVE = 1;
-static constexpr int BG_FP_SHIFT = 8;
 static constexpr float BG_X_WOBBLE_AMPLITUDE = 0.48f;
 static constexpr float BG_Y_SCROLL_UNITS = 4.0f;
 static constexpr float BG_DEPTH_X_SCALE_SHALLOW = 0.82f;
@@ -113,11 +110,13 @@ static constexpr int FLOW_LINE_SPACING = 42;
 static constexpr int FLOW_LINE_DX = 70;
 static constexpr int FLOW_LINE_Y1 = TOP_BAR_H + 18;
 
-#define ENABLE_HOT_PIXEL_SUPPRESS 0
-#define ENABLE_SMOOTH_SHADE 0
-#define USE_DEBUG_CONSERVATIVE_RASTER 0
-#define ENABLE_BACKFACE_CULL 1
-#define RASTER_CRACK_FIX_PAD 0
+// Torus lighting: normalized a1k0n-style light direction in the rotated
+// Y/Z plane.  Keeping LIGHT_X at zero lets the hot path use only normalY/Z.
+static constexpr float TORUS_LIGHT_Y = 0.70710678f;
+static constexpr float TORUS_LIGHT_Z = -0.70710678f;
+static constexpr float TORUS_LIGHT_AMBIENT = 0.08f;
+static constexpr float TORUS_LIGHT_DIFFUSE = 0.92f;
+
 
 // -----------------------------------------------------------------------------
 // Types and settings
@@ -153,7 +152,7 @@ struct RuntimeSettings {
     bool showSystemPanel = false;
     bool showStopwatchPanel = false;
     bool glowEnabled = false;
-    bool highQuality = false;
+    bool smoothNormalsEnabled = true;  // H: analytic normal Gouraud shading.
     bool paused = false;
     bool idleOrbitEnabled = true;
     bool bgFxEnabled = true;
@@ -177,10 +176,7 @@ struct DrawPalette {
 
 struct BufferPalette {
     uint16_t plainBg;
-    uint16_t checkerTone[5];
     uint16_t flow;
-    uint16_t gridLine;
-    uint16_t gridLineNear;
     uint16_t fxDim;
     uint16_t fxBright;
     uint16_t donut[256];
@@ -207,7 +203,7 @@ enum ActionId {
     ACT_FLOAT,
     ACT_KEYS,
     ACT_GLOW,
-    ACT_QUALITY,
+    ACT_NORMALS,
     ACT_PAUSE,
     ACT_FPS,
     ACT_SPEED_UP,
@@ -300,18 +296,14 @@ static uint8_t shadeBuf[SCREEN_PIXELS];
 static uint8_t glowBuf[SCREEN_PIXELS];
 static uint16_t bgCache[SCREEN_PIXELS];
 
-static MeshVertex rowFirst[HQ_PHI];
-static MeshVertex rowA[HQ_PHI];
-static MeshVertex rowB[HQ_PHI];
+static MeshVertex rowFirst[STD_PHI];
+static MeshVertex rowA[STD_PHI];
+static MeshVertex rowB[STD_PHI];
 
 static float sinThetaStd[STD_THETA];
 static float cosThetaStd[STD_THETA];
 static float sinPhiStd[STD_PHI];
 static float cosPhiStd[STD_PHI];
-static float sinThetaHq[HQ_THETA];
-static float cosThetaHq[HQ_THETA];
-static float sinPhiHq[HQ_PHI];
-static float cosPhiHq[HQ_PHI];
 
 static RuntimeSettings settings;
 static DrawPalette drawPalette;
@@ -378,17 +370,9 @@ static float measuredFps = 0.0f;
 
 static uint32_t bgBuildUs = 0;
 static uint32_t bgCopyUs = 0;
-static uint32_t bgFxUs = 0;
 static uint32_t donutTimeUs = 0;
 static uint32_t composeTimeUs = 0;
 static uint32_t pushTimeUs = 0;
-static uint32_t glowUs = 0;
-static uint32_t uiUs = 0;
-static uint32_t inputUs = 0;
-static uint32_t motionUs = 0;
-static uint32_t primitiveCount = 0;
-static uint32_t culledCount = 0;
-static uint32_t rasterizedCount = 0;
 static uint32_t fillPixelCount = 0;
 
 // -----------------------------------------------------------------------------
@@ -400,11 +384,6 @@ static inline uint8_t clampU8(int v) {
     return (uint8_t)v;
 }
 
-static inline float clamp01(float v) {
-    if (v < 0.0f) return 0.0f;
-    if (v > 1.0f) return 1.0f;
-    return v;
-}
 
 static inline float clampFloat(float v, float lo, float hi) {
     if (v < lo) return lo;
@@ -490,6 +469,26 @@ static inline uint16_t depthToU16(float invZ) {
     return (uint16_t)v;
 }
 
+// Analytic torus normal shading.  For a torus parameterized by theta/phi,
+// the object-space unit normal is (cos(theta)cos(phi), cos(theta)sin(phi),
+// sin(theta)).  buildMeshRow() rotates it with the same transform as the
+// vertex and passes only Y/Z here because the chosen light has no X component.
+static inline uint8_t shadeFromTorusNormalYZ(float normalY, float normalZ) {
+    float diffuse = normalY * TORUS_LIGHT_Y + normalZ * TORUS_LIGHT_Z;
+    if (diffuse < 0.0f) diffuse = 0.0f;
+    if (diffuse > 1.0f) diffuse = 1.0f;
+
+    float lit = TORUS_LIGHT_AMBIENT + TORUS_LIGHT_DIFFUSE * diffuse;
+    if (lit > 1.0f) lit = 1.0f;
+
+    int shade = (int)((float)LUM_DARK_MIN
+                    + lit * (float)(LUM_BRIGHT_MAX - LUM_DARK_MIN)
+                    + 0.5f);
+    if (shade < (int)LUM_DARK_MIN) return LUM_DARK_MIN;
+    if (shade > (int)LUM_BRIGHT_MAX) return LUM_BRIGHT_MAX;
+    return (uint8_t)shade;
+}
+
 static void clampPersistentSettings() {
     if (settings.themeIndex >= THEME_COUNT) settings.themeIndex = 0;
     settings.backgroundMode &= 3;
@@ -528,7 +527,7 @@ static void loadPersistentSettings() {
     settings.rgbPlusEnabled = prefs.getBool("rgbplus", settings.rgbPlusEnabled);
     settings.floatingTextMode = prefs.getUChar("txtmode", settings.floatingTextMode);
     settings.glowEnabled = prefs.getBool("glow", settings.glowEnabled);
-    settings.highQuality = prefs.getBool("hq", settings.highQuality);
+    settings.smoothNormalsEnabled = prefs.getBool("smooth", settings.smoothNormalsEnabled);
     settings.frameTargetIndex = prefs.getUChar("fps", settings.frameTargetIndex);
     settings.motionProfile = prefs.getUChar("motion", settings.motionProfile);
     settings.bgDepthLevel = prefs.getUChar("depth", settings.bgDepthLevel);
@@ -548,7 +547,7 @@ static void savePersistentSettingsNow() {
     prefs.putBool("rgbplus", settings.rgbPlusEnabled);
     prefs.putUChar("txtmode", settings.floatingTextMode);
     prefs.putBool("glow", settings.glowEnabled);
-    prefs.putBool("hq", settings.highQuality);
+    prefs.putBool("smooth", settings.smoothNormalsEnabled);
     prefs.putUChar("fps", settings.frameTargetIndex);
     prefs.putUChar("motion", settings.motionProfile);
     prefs.putUChar("depth", settings.bgDepthLevel);
@@ -615,9 +614,6 @@ static void rebuildPalettes() {
         }
     }
 
-    for (int mix = 0; mix < 5; ++mix) {
-        bufPalette.checkerTone[mix] = bgToneLut[BG_H - 1][mix];
-    }
     drawPalette.topBar = draw565(theme.r / 36 + 2, theme.g / 36 + 4, theme.b / 36 + 8);
     drawPalette.topLine = draw565(clampU8(theme.r / 3 + 18),
                                   clampU8(theme.g / 3 + 24),
@@ -645,8 +641,6 @@ static void rebuildPalettes() {
     }
     drawPalette.flow = draw565(flowRgb.r, flowRgb.g, flowRgb.b);
     bufPalette.flow = bufFromDraw(drawPalette.flow);
-    bufPalette.gridLine = bufFromDraw(draw565(theme.r / 32 + 2, theme.g / 32 + 9, theme.b / 32 + 14));
-    bufPalette.gridLineNear = bufFromDraw(draw565(theme.r / 24 + 3, theme.g / 24 + 13, theme.b / 24 + 22));
     bufPalette.fxDim = bufFromDraw(draw565(fxDimRgb.r, fxDimRgb.g, fxDimRgb.b));
     bufPalette.fxBright = bufFromDraw(draw565(fxBrightRgb.r, fxBrightRgb.g, fxBrightRgb.b));
 
@@ -707,12 +701,6 @@ static inline bool dirtyValid() {
     return dirtyMaxX >= dirtyMinX && dirtyMaxY >= dirtyMinY;
 }
 
-static inline void touchDirty(int x, int y) {
-    if (x < dirtyMinX) dirtyMinX = x;
-    if (x > dirtyMaxX) dirtyMaxX = x;
-    if (y < dirtyMinY) dirtyMinY = y;
-    if (y > dirtyMaxY) dirtyMaxY = y;
-}
 
 static inline void expandedDirtyRect(int pad, int& x0, int& y0, int& x1, int& y1) {
     x0 = dirtyMinX - pad;
@@ -951,121 +939,6 @@ static void drawBackgroundFxOverlay(uint16_t* out) {
 // -----------------------------------------------------------------------------
 // Filled triangle rasterizer
 
-#if USE_DEBUG_CONSERVATIVE_RASTER
-// Debug fallback rasterizer.  Kept out of release builds by default.
-static bool edgeScanIntersect(const MeshVertex& a, const MeshVertex& b, float fy, EdgeValue& out) {
-    float dy = b.y - a.y;
-    if (fabsf(dy) < 0.0001f) return false;
-
-    float minY = fminf(a.y, b.y);
-    float maxY = fmaxf(a.y, b.y);
-    if (fy < minY - 0.65f || fy > maxY + 0.65f) return false;
-
-    float t = (fy - a.y) / dy;
-    if (t < -0.08f || t > 1.08f) return false;
-    t = clamp01(t);
-
-    out.x = a.x + (b.x - a.x) * t;
-    out.z = a.z + (b.z - a.z) * t;
-    out.shade = a.shade + (b.shade - a.shade) * t;
-    return true;
-}
-
-static void drawSpanConservative(int y, EdgeValue l, EdgeValue r) {
-    if (y < TOP_BAR_H || y >= SCREEN_H) return;
-    if (l.x > r.x) {
-        EdgeValue t = l;
-        l = r;
-        r = t;
-    }
-
-    int x0 = (int)floorf(l.x) - 1;
-    int x1 = (int)ceilf(r.x) + 1;
-    if (x1 < 0 || x0 >= SCREEN_W || x0 > x1) return;
-    if (x0 < 0) x0 = 0;
-    if (x1 >= SCREEN_W) x1 = SCREEN_W - 1;
-
-    float width = r.x - l.x;
-    float z = l.z;
-    float shade = l.shade;
-    float dz = 0.0f;
-    float ds = 0.0f;
-    if (fabsf(width) > 0.001f) {
-        dz = (r.z - l.z) / width;
-        ds = (r.shade - l.shade) / width;
-        float advance = ((float)x0 + 0.5f) - l.x;
-        z += dz * advance;
-        shade += ds * advance;
-    } else {
-        z = (l.z + r.z) * 0.5f;
-        shade = (l.shade + r.shade) * 0.5f;
-    }
-
-    int32_t zFx = (int32_t)(z * 256.0f);
-    int32_t sFx = (int32_t)(shade * 256.0f);
-    int32_t dzFx = (int32_t)(dz * 256.0f);
-    int32_t dsFx = (int32_t)(ds * 256.0f);
-    int idx = y * SCREEN_W + x0;
-
-    for (int x = x0; x <= x1; ++x, ++idx) {
-        int zi = zFx >> 8;
-        if (zi < 0) zi = 0;
-        if (zi > 65535) zi = 65535;
-        uint16_t depth = (uint16_t)zi;
-        if (depth > zBuf[idx]) {
-            int si = sFx >> 8;
-            if (si < LUM_DARK_MIN) si = LUM_DARK_MIN;
-            if (si > LUM_BRIGHT_MAX) si = LUM_BRIGHT_MAX;
-            zBuf[idx] = depth;
-            shadeBuf[idx] = (uint8_t)si;
-            touchDirty(x, y);
-            ++fillPixelCount;
-        }
-        zFx += dzFx;
-        sFx += dsFx;
-    }
-}
-
-static void rasterTriangle(MeshVertex a, MeshVertex b, MeshVertex c) {
-    float minX = fminf(a.x, fminf(b.x, c.x));
-    float maxX = fmaxf(a.x, fmaxf(b.x, c.x));
-    float minY = fminf(a.y, fminf(b.y, c.y));
-    float maxY = fmaxf(a.y, fmaxf(b.y, c.y));
-    if (maxX < 0.0f || minX >= (float)SCREEN_W || maxY < (float)TOP_BAR_H || minY >= (float)SCREEN_H) return;
-
-    float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-    if (fabsf(area) < TRI_AREA_MIN) return;
-
-    ++rasterizedCount;
-
-    int ys = (int)floorf(minY) - 1;
-    int ye = (int)ceilf(maxY) + 1;
-    if (ys < TOP_BAR_H) ys = TOP_BAR_H;
-    if (ye >= SCREEN_H) ye = SCREEN_H - 1;
-
-    for (int y = ys; y <= ye; ++y) {
-        float fy = (float)y + 0.5f;
-        EdgeValue hits[3];
-        int count = 0;
-
-        if (edgeScanIntersect(a, b, fy, hits[count])) ++count;
-        if (edgeScanIntersect(b, c, fy, hits[count])) ++count;
-        if (edgeScanIntersect(c, a, fy, hits[count])) ++count;
-
-        if (count < 2) continue;
-
-        EdgeValue left = hits[0];
-        EdgeValue right = hits[0];
-        for (int i = 1; i < count; ++i) {
-            if (hits[i].x < left.x) left = hits[i];
-            if (hits[i].x > right.x) right = hits[i];
-        }
-
-        drawSpanConservative(y, left, right);
-    }
-}
-#endif
-
 static inline float quadSignedArea2(const MeshVertex& a, const MeshVertex& b,
                                     const MeshVertex& c, const MeshVertex& d) {
     return (a.x * b.y - a.y * b.x)
@@ -1097,16 +970,8 @@ static inline bool quadOffscreen(const MeshVertex& a, const MeshVertex& b,
 
 static inline bool quadBackFacing(const MeshVertex& a, const MeshVertex& b,
                                   const MeshVertex& c, const MeshVertex& d) {
-#if ENABLE_BACKFACE_CULL
     float nz = (a.nz + b.nz + c.nz + d.nz) * 0.25f;
     return nz >= BACKFACE_EPS;
-#else
-    (void)a;
-    (void)b;
-    (void)c;
-    (void)d;
-    return false;
-#endif
 }
 
 static inline bool edgeScanIntersectFast(const MeshVertex& a, const MeshVertex& b,
@@ -1120,11 +985,7 @@ static inline bool edgeScanIntersectFast(const MeshVertex& a, const MeshVertex& 
 
     out.x = a.x + (b.x - a.x) * t;
     out.z = a.z + (b.z - a.z) * t;
-#if ENABLE_SMOOTH_SHADE
     out.shade = a.shade + (b.shade - a.shade) * t;
-#else
-    out.shade = 0.0f;
-#endif
     return true;
 }
 
@@ -1136,40 +997,36 @@ static void drawSpanFast(int y, EdgeValue l, EdgeValue r, uint8_t flatShade) {
         r = t;
     }
 
-    int x0 = (int)floorf(l.x) - RASTER_CRACK_FIX_PAD;
-    int x1 = (int)ceilf(r.x) + RASTER_CRACK_FIX_PAD;
+    int x0 = (int)floorf(l.x);
+    int x1 = (int)ceilf(r.x);
     if (x1 < 0 || x0 >= SCREEN_W || x0 > x1) return;
     if (x0 < 0) x0 = 0;
     if (x1 >= SCREEN_W) x1 = SCREEN_W - 1;
 
+    const bool smooth = settings.smoothNormalsEnabled;
     float width = r.x - l.x;
     float z = l.z;
     float dz = 0.0f;
-#if ENABLE_SMOOTH_SHADE
     float shade = l.shade;
     float ds = 0.0f;
-#endif
+
     if (fabsf(width) > 0.001f) {
         dz = (r.z - l.z) / width;
         float advance = ((float)x0 + 0.5f) - l.x;
         z += dz * advance;
-#if ENABLE_SMOOTH_SHADE
-        ds = (r.shade - l.shade) / width;
-        shade += ds * advance;
-#endif
+        if (smooth) {
+            ds = (r.shade - l.shade) / width;
+            shade += ds * advance;
+        }
     } else {
         z = (l.z + r.z) * 0.5f;
-#if ENABLE_SMOOTH_SHADE
-        shade = (l.shade + r.shade) * 0.5f;
-#endif
+        if (smooth) shade = (l.shade + r.shade) * 0.5f;
     }
 
     int32_t zFx = (int32_t)(z * 256.0f);
     int32_t dzFx = (int32_t)(dz * 256.0f);
-#if ENABLE_SMOOTH_SHADE
     int32_t sFx = (int32_t)(shade * 256.0f);
     int32_t dsFx = (int32_t)(ds * 256.0f);
-#endif
     int idx = y * SCREEN_W + x0;
     int firstWriteX = -1;
     int lastWriteX = -1;
@@ -1180,23 +1037,21 @@ static void drawSpanFast(int y, EdgeValue l, EdgeValue r, uint8_t flatShade) {
         if (zi > 65535) zi = 65535;
         uint16_t depth = (uint16_t)zi;
         if (depth > zBuf[idx]) {
-#if ENABLE_SMOOTH_SHADE
-            int si = sFx >> 8;
-            if (si < LUM_DARK_MIN) si = LUM_DARK_MIN;
-            if (si > LUM_BRIGHT_MAX) si = LUM_BRIGHT_MAX;
-            shadeBuf[idx] = (uint8_t)si;
-#else
-            shadeBuf[idx] = flatShade;
-#endif
+            if (smooth) {
+                int si = sFx >> 8;
+                if (si < LUM_DARK_MIN) si = LUM_DARK_MIN;
+                if (si > LUM_BRIGHT_MAX) si = LUM_BRIGHT_MAX;
+                shadeBuf[idx] = (uint8_t)si;
+            } else {
+                shadeBuf[idx] = flatShade;
+            }
             zBuf[idx] = depth;
             if (firstWriteX < 0) firstWriteX = x;
             lastWriteX = x;
             ++fillPixelCount;
         }
         zFx += dzFx;
-#if ENABLE_SMOOTH_SHADE
-        sFx += dsFx;
-#endif
+        if (smooth) sFx += dsFx;
     }
 
     if (firstWriteX >= 0) {
@@ -1209,22 +1064,16 @@ static void drawSpanFast(int y, EdgeValue l, EdgeValue r, uint8_t flatShade) {
 
 static void rasterQuadSolid(const MeshVertex& a, const MeshVertex& b,
                             const MeshVertex& c, const MeshVertex& d) {
-    ++primitiveCount;
-
     if (quadOffscreen(a, b, c, d)) return;
 
     float area2 = quadSignedArea2(a, b, c, d);
     if (fabsf(area2) < TRI_AREA_MIN) {
-        ++culledCount;
         return;
     }
 
     if (quadBackFacing(a, b, c, d)) {
-        ++culledCount;
         return;
     }
-
-    ++rasterizedCount;
 
     float minYf = a.y;
     if (b.y < minYf) minYf = b.y;
@@ -1270,7 +1119,7 @@ static void rasterQuadSolid(const MeshVertex& a, const MeshVertex& b,
 // -----------------------------------------------------------------------------
 // Solid torus mesh
 
-static void buildMeshRow(int thetaIndex, int thetaCount, int phiCount,
+static void buildMeshRow(int thetaIndex, int phiCount,
                          const float* sinTheta, const float* cosTheta,
                          const float* sinPhi, const float* cosPhi,
                          float cA, float sA, float cB, float sB,
@@ -1282,7 +1131,6 @@ static void buildMeshRow(int thetaIndex, int thetaCount, int phiCount,
     float centerX = (float)SCREEN_W * 0.5f + manualOffsetX + orbitOffsetX;
     float centerY = (float)TOP_BAR_H + (float)RENDER_H * 0.50f + manualOffsetY + orbitOffsetY;
     float scale = clampFloat(settings.donutScale + orbitScaleAdd, 70.0f, 112.0f);
-    (void)thetaCount;
 
     float xCp = circleX * cB;
     float xSp = circleX * sA * sB;
@@ -1292,11 +1140,13 @@ static void buildMeshRow(int thetaIndex, int thetaCount, int phiCount,
     float yConst = circleY * cA * cB;
     float zSp = cA * circleX;
     float zConst = sA * circleY;
-    float nzSp = cA * ct;
-    float nzConst = sA * st;
-    float lumCp = ct * sB;
-    float lumSp = -cA * ct - cB * ct * sA;
-    float lumConst = -sA * st + cB * cA * st;
+    // Rotated analytic normal coefficients.  The torus normal is unit length
+    // by construction, so there is no per-vertex sqrt/normalization cost.
+    float normalYCp = ct * sB;
+    float normalYSp = -ct * sA * cB;
+    float normalYConst = st * cA * cB;
+    float normalZSp = cA * ct;
+    float normalZConst = sA * st;
 
     for (int pi = 0; pi < phiCount; ++pi) {
         float cp = cosPhi[pi];
@@ -1307,15 +1157,14 @@ static void buildMeshRow(int thetaIndex, int thetaCount, int phiCount,
         float z = zSp * sp + zConst;
         float invZ = 1.0f / (CAMERA_Z + z);
 
-        float lum = lumCp * cp + lumSp * sp + lumConst;
-        float lumNorm = lum <= 0.0f ? 0.0f : clamp01(lum * 0.65f + 0.08f);
-        float shade = (float)LUM_DARK_MIN + lumNorm * (float)(LUM_BRIGHT_MAX - LUM_DARK_MIN);
+        float normalY = normalYCp * cp + normalYSp * sp + normalYConst;
+        float normalZ = normalZSp * sp + normalZConst;
 
         row[pi].x = centerX + scale * invZ * x;
         row[pi].y = centerY - scale * invZ * y;
         row[pi].z = depthToU16(invZ);
-        row[pi].shade = shade;
-        row[pi].nz = nzSp * sp + nzConst;
+        row[pi].shade = (float)shadeFromTorusNormalYZ(normalY, normalZ);
+        row[pi].nz = normalZ;
     }
 }
 
@@ -1327,25 +1176,17 @@ static void rasterRows(const MeshVertex* row0, const MeshVertex* row1, int phiCo
         const MeshVertex& b = row1[pi];
         const MeshVertex& c = row1[pn];
         const MeshVertex& d = row0[pn];
-#if USE_DEBUG_CONSERVATIVE_RASTER
-        ++primitiveCount;
-        rasterTriangle(a, b, c);
-        ++primitiveCount;
-        rasterTriangle(a, c, d);
-#else
         rasterQuadSolid(a, b, c, d);
-#endif
     }
 }
 
 static void renderDonutSolidMesh() {
-    const bool hq = settings.highQuality;
-    const int thetaCount = hq ? HQ_THETA : STD_THETA;
-    const int phiCount = hq ? HQ_PHI : STD_PHI;
-    const float* sinTheta = hq ? sinThetaHq : sinThetaStd;
-    const float* cosTheta = hq ? cosThetaHq : cosThetaStd;
-    const float* sinPhi = hq ? sinPhiHq : sinPhiStd;
-    const float* cosPhi = hq ? cosPhiHq : cosPhiStd;
+    const int thetaCount = STD_THETA;
+    const int phiCount = STD_PHI;
+    const float* sinTheta = sinThetaStd;
+    const float* cosTheta = cosThetaStd;
+    const float* sinPhi = sinPhiStd;
+    const float* cosPhi = cosPhiStd;
 
     float cA = rotCA;
     float sA = rotSA;
@@ -1355,11 +1196,11 @@ static void renderDonutSolidMesh() {
     MeshVertex* curr = rowA;
     MeshVertex* next = rowB;
 
-    buildMeshRow(0, thetaCount, phiCount, sinTheta, cosTheta, sinPhi, cosPhi, cA, sA, cB, sB, curr);
+    buildMeshRow(0, phiCount, sinTheta, cosTheta, sinPhi, cosPhi, cA, sA, cB, sB, curr);
     memcpy(rowFirst, curr, sizeof(MeshVertex) * (size_t)phiCount);
 
     for (int ti = 1; ti < thetaCount; ++ti) {
-        buildMeshRow(ti, thetaCount, phiCount, sinTheta, cosTheta, sinPhi, cosPhi, cA, sA, cB, sB, next);
+        buildMeshRow(ti, phiCount, sinTheta, cosTheta, sinPhi, cosPhi, cA, sA, cB, sB, next);
         rasterRows(curr, next, phiCount);
         MeshVertex* t = curr;
         curr = next;
@@ -1372,31 +1213,6 @@ static void renderDonutSolidMesh() {
 // -----------------------------------------------------------------------------
 // Post process and composition
 
-#if ENABLE_HOT_PIXEL_SUPPRESS
-static void suppressHotPixelsDirtyOnly() {
-    if (!dirtyValid()) return;
-
-    int x0, y0, x1, y1;
-    expandedDirtyRect(1, x0, y0, x1, y1);
-    if (x0 < 1) x0 = 1;
-    if (x1 > SCREEN_W - 2) x1 = SCREEN_W - 2;
-    if (y0 < TOP_BAR_H + 1) y0 = TOP_BAR_H + 1;
-    if (y1 > SCREEN_H - 2) y1 = SCREEN_H - 2;
-
-    for (int y = y0; y <= y1; ++y) {
-        int idx = y * SCREEN_W + x0;
-        for (int x = x0; x <= x1; ++x, ++idx) {
-            uint8_t s = shadeBuf[idx];
-            if (s < 206) continue;
-            uint16_t n = (uint16_t)shadeBuf[idx - 1]
-                       + (uint16_t)shadeBuf[idx + 1]
-                       + (uint16_t)shadeBuf[idx - SCREEN_W]
-                       + (uint16_t)shadeBuf[idx + SCREEN_W];
-            if (n < 96) shadeBuf[idx] = 188;
-        }
-    }
-}
-#endif
 
 static inline void glowMax(int x, int y, uint8_t amount) {
     if ((unsigned)x >= SCREEN_W || y < TOP_BAR_H || y >= SCREEN_H || amount == 0) return;
@@ -1480,23 +1296,7 @@ static void composeDonutDirtyOnly(uint16_t* out) {
 // -----------------------------------------------------------------------------
 // UI
 
-static inline void printShadowText(int x, int y, const char* text, uint16_t fg) {
-    canvas.setTextColor(drawPalette.hudBg);
-    canvas.setCursor(x + 1, y + 1);
-    canvas.print(text);
-    canvas.setTextColor(fg);
-    canvas.setCursor(x, y);
-    canvas.print(text);
-}
 
-static inline void printShadowChar(int x, int y, char ch, uint16_t fg) {
-    canvas.setTextColor(drawPalette.hudBg);
-    canvas.setCursor(x + 1, y + 1);
-    canvas.print(ch);
-    canvas.setTextColor(fg);
-    canvas.setCursor(x, y);
-    canvas.print(ch);
-}
 
 static void drawBgTextRibbonRow(const char* text, int y, int phasePx, uint16_t color) {
     int len = (int)strlen(text);
@@ -1567,8 +1367,7 @@ static void drawPanelFrame(int x, int y, int w, int h);
 static void printPanelLine(int x, int y, const char* text, uint16_t color);
 
 static void pushToast(const char* msg) {
-    strncpy(toastState.text, msg, sizeof(toastState.text) - 1);
-    toastState.text[sizeof(toastState.text) - 1] = '\0';
+    snprintf(toastState.text, sizeof(toastState.text), "%s", msg ? msg : "");
     toastState.startMs = millis();
     toastState.durationMs = TOAST_MS;
     toastState.active = true;
@@ -1779,7 +1578,7 @@ static void drawHelpPanel() {
 
     if (helpPage == 0) {
         printPanelLine(x + 5, y + 15, "SPC Theme B BG C RGB+", drawPalette.textDim);
-        printPanelLine(x + 5, y + 26, "T RIB O Orb G Glow H HQ", drawPalette.hint);
+        printPanelLine(x + 5, y + 26, "T RIB O Orb G Glow H Smooth", drawPalette.hint);
     } else if (helpPage == 1) {
         printPanelLine(x + 5, y + 15, "WASD Pan  +/- Scale  0 View", drawPalette.textDim);
         printPanelLine(x + 5, y + 26, ";/. Speed  [/] Bright  QE Depth", drawPalette.hint);
@@ -1872,7 +1671,7 @@ static void drawSystemPanel() {
         printPanelLine(x + 4, y + 26, line, drawPalette.textDim);
         snprintf(line, sizeof(line), "TXT %s", floatingTextModeName());
         printPanelLine(x + 4, y + 37, line, drawPalette.textDim);
-        snprintf(line, sizeof(line), "RGB%u G%u H%u O%u", (unsigned)(settings.rgbPlusEnabled ? 1 : 0), (unsigned)(settings.glowEnabled ? 1 : 0), (unsigned)(settings.highQuality ? 1 : 0), (unsigned)(settings.idleOrbitEnabled ? 1 : 0));
+        snprintf(line, sizeof(line), "RGB%u G%u S%u O%u", (unsigned)(settings.rgbPlusEnabled ? 1 : 0), (unsigned)(settings.glowEnabled ? 1 : 0), (unsigned)(settings.smoothNormalsEnabled ? 1 : 0), (unsigned)(settings.idleOrbitEnabled ? 1 : 0));
         printPanelLine(x + 4, y + 48, line, drawPalette.textDim);
         {
             int spd10 = (int)(settings.rotationSpeed * 10.0f + 0.5f);
@@ -2215,10 +2014,10 @@ static void handleInput() {
         pushToast(settings.glowEnabled ? "GLOW ON" : "GLOW OFF");
         used = true;
     }
-    if (actionEdge(ACT_QUALITY, down[ACT_QUALITY])) {
-        settings.highQuality = !settings.highQuality;
+    if (actionEdge(ACT_NORMALS, down[ACT_NORMALS])) {
+        settings.smoothNormalsEnabled = !settings.smoothNormalsEnabled;
         persist = true;
-        pushToast(settings.highQuality ? "QUALITY HQ" : "QUALITY STD");
+        pushToast(settings.smoothNormalsEnabled ? "SMOOTH ON" : "SMOOTH OFF");
         used = true;
     }
     if (actionEdge(ACT_PAUSE, down[ACT_PAUSE])) {
@@ -2510,8 +2309,6 @@ void setup() {
 
     buildTrigTable(STD_THETA, sinThetaStd, cosThetaStd);
     buildTrigTable(STD_PHI, sinPhiStd, cosPhiStd);
-    buildTrigTable(HQ_THETA, sinThetaHq, cosThetaHq);
-    buildTrigTable(HQ_PHI, sinPhiHq, cosPhiHq);
     resetRotationState();
 
     startMs = millis();
@@ -2530,52 +2327,36 @@ void setup() {
 void loop() {
     uint32_t frameStartUs = micros();
 
-    uint32_t in0 = micros();
     M5Cardputer.update();
     handleInput();
     updateWatchState();
     servicePersistentSettings();
     serviceDisplayPower();
-    inputUs = micros() - in0;
 
     if (paletteDirty) {
         rebuildPalettes();
         bgCacheDirty = true;
     }
 
-    uint32_t mo0 = micros();
     updateAngles();
     updateMotionState();
     updateBackgroundAnimationState();
-    motionUs = micros() - mo0;
 
     updateBackgroundCacheIfNeeded();
     copyBackgroundCacheToCanvas();
 
-    uint32_t fx0 = micros();
     drawBackgroundFxOverlay(canvasBuf);
-    bgFxUs = micros() - fx0;
 
     if (settings.floatingTextMode != 0) drawBehindTextAndHints();
 
     clearRenderBuffers();
-    primitiveCount = 0;
-    culledCount = 0;
-    rasterizedCount = 0;
     fillPixelCount = 0;
     uint32_t t1 = micros();
     renderDonutSolidMesh();
     uint32_t t2 = micros();
 
-#if ENABLE_HOT_PIXEL_SUPPRESS
-    suppressHotPixelsDirtyOnly();
-#endif
     if (settings.glowEnabled) {
-        uint32_t g0 = micros();
         buildGlowDirtyOnly();
-        glowUs = micros() - g0;
-    } else {
-        glowUs = 0;
     }
     composeDonutDirtyOnly(canvasBuf);
     uint32_t t3 = micros();
@@ -2583,14 +2364,12 @@ void loop() {
     donutTimeUs = t2 - t1;
     composeTimeUs = t3 - t2;
 
-    uint32_t ui0 = micros();
     drawBootOverlay();
     if (settings.showSystemPanel) drawSystemPanel();
     drawStopwatchPanel();
     drawHelpPanel();
     drawToast();
     drawTopBar();
-    uiUs = micros() - ui0;
 
     canvas.setSwapBytes(false);
     uint32_t p0 = micros();
